@@ -8,7 +8,7 @@ GuardedCoder is intentionally **non-autonomous**. The model cannot run shell com
 
 AI thinks and proposes. Local deterministic code validates. A human decides whether anything gets applied.
 
-GuardedCoder provides a middle ground between read-only AI assistants and highly autonomous coding agents with broad shell and write access. It gathers a small amount of relevant repository context, asks a hosted OpenAI-compatible model for an answer or structured text replacement, and keeps all file-changing actions behind a separate approval step.
+GuardedCoder provides a middle ground between read-only AI assistants and highly autonomous coding agents with broad shell and write access. It gathers a small amount of relevant repository context, asks a hosted OpenAI-compatible model for an answer or structured text edits, and keeps all file-changing actions behind a separate approval step.
 
 ## Core workflow
 
@@ -17,7 +17,7 @@ QUESTION → SUGGEST → local validation → approval token → explicit APPLY 
 ```
 
 - **QUESTION** sends bounded, relevant repository context for an explanation. It does not write.
-- **SUGGEST** asks for a JSON replacement proposal: an existing file path, exact old text, exact new text, and optional reason. Local code checks that the old text occurs exactly once and creates the unified diff. It does not write.
+- **SUGGEST** asks for a JSON list of edits, each containing an existing file path, exact old text, exact new text, and optional reason. Local code requires each old-text value to occur exactly once, creates a combined unified diff, and validates it. It does not write. Suggestions are limited to three files by default.
 - **APPLY** requires the proposal's approval token and a separate explicit `APPLY` confirmation. Local code applies the validated diff, runs the repository's tests, and shows the resulting diff.
 
 QUESTION and SUGGEST send the prompt and bounded selected source snippets to the configured model provider. Use them only with code you are allowed to share with that provider.
@@ -73,15 +73,21 @@ Supported environment variables:
 
 Both pricing variables must be set together. Estimates use provider-reported token usage and are not billing guarantees.
 
+### Optional repository policy
+
+A repository may define `.guardedcoder.json`. This is a repository-specific policy for the repository GuardedCoder is working on, not GuardedCoder’s global configuration. GuardedCoder works without it. To use the included example, copy `.guardedcoder.example.json` into the target repository as `.guardedcoder.json`, then adapt the paths and test settings for that repository. The example file is not active configuration. Unknown fields and invalid values are rejected.
+
+`allowed_paths` restricts suggestion and apply targets. `forbidden_paths` adds restrictions; neither setting can disable GuardedCoder's built-in protections. The file limit defaults to 3 and may be lowered, but cannot be raised. `test_command` must be an argv array and is deliberately limited to Python `unittest discover` with a repository-root start, optional filename pattern, and verbosity flag. It is never interpreted by a shell. Sensitive files, `.git`, symlinks, binary targets, and file creation/deletion/rename/mode changes remain prohibited regardless of policy settings.
+
 ## Usage
 
-Start the interactive CLI:
+Start with a repository path:
 
 ```sh
-python3 assistant_cli.py
+python3 assistant_cli.py /path/to/repository
 ```
 
-Enter the path to a Git working tree, such as `/path/to/repository`, then choose a mode:
+If no path is supplied, GuardedCoder prompts for one. Choose a mode:
 
 1. **question** — ask a question about the repository. The assistant searches and reads bounded context, then returns an explanation.
 2. **suggest** — describe a small fix. Review the validated diff and its approval token. No file is changed.
@@ -105,9 +111,9 @@ Tests use temporary Git repositories and mocked provider responses. They do not 
 ## Limitations
 
 - Context collection is intentionally bounded and may omit relevant code in larger repositories.
-- A SUGGEST proposal is limited to one exact text replacement in one existing UTF-8 text file; the old text must occur exactly once.
+- A SUGGEST proposal is limited to three exact text replacements across existing UTF-8 text files by default; every old-text value must occur exactly once. Optional policy can lower this bound.
 - Changes that Git cannot validate, including some newline-format edge cases, are rejected.
-- Tests are run using the repository's unittest discovery command; projects with different test setups may need adaptation.
+- Tests are run with a bounded Python `unittest discover` argv. Projects using other test runners need adaptation; arbitrary test commands are not supported.
 - APPLY does not automatically roll back when tests fail.
 
 ## Security

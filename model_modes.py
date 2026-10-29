@@ -3,7 +3,7 @@ import difflib
 import json
 import re
 from pathlib import Path
-from tools import ToolError, safe_existing_text_file
+from tools import MAX_SUGGESTION_FILES, ToolError, enforce_path_policy, safe_existing_text_file
 
 
 MAX_CONTEXT_CHARS = 9000
@@ -15,6 +15,10 @@ QUESTION_TOOLS = ("list_files", "search_text", "read_file")
 MAX_REPLACEMENT_CHARS = 16_000
 
 
+class ModelResponseError(ToolError):
+    """The provider returned text that does not match the expected response schema."""
+
+
 def _unique_object(pairs):
     obj = {}
     for key, value in pairs:
@@ -24,31 +28,46 @@ def _unique_object(pairs):
     return obj
 
 
-def parse_edit_proposal(raw):
-    """Parse the strict model JSON schema without accepting diff-like text."""
+def parse_edit_proposal(raw, *, max_files=MAX_SUGGESTION_FILES):
+    """Parse bounded structured edits; never accept model-authored patch text."""
     try:
         proposal = json.loads(raw, object_pairs_hook=_unique_object)
     except (TypeError, ValueError):
-        raise ToolError("model response must be valid proposal JSON") from None
+        raise ModelResponseError("model response must be valid proposal JSON") from None
     if proposal is None:
-        return None
+        raise ModelResponseError("proposal JSON must contain an edits array")
     if not isinstance(proposal, dict):
-        raise ToolError("proposal JSON must be an object")
-    required = {"path", "old_text", "new_text"}
-    allowed = required | {"reason"}
-    if not required.issubset(proposal) or not set(proposal).issubset(allowed):
-        raise ToolError("proposal JSON fields must be path, old_text, new_text, and optional reason")
-    if any(not isinstance(proposal.get(key), str) for key in required):
-        raise ToolError("proposal path and replacement text fields must be strings")
-    if not proposal["old_text"]:
-        raise ToolError("old_text must not be empty")
-    if len(proposal["old_text"]) > MAX_REPLACEMENT_CHARS or len(proposal["new_text"]) > MAX_REPLACEMENT_CHARS:
-        raise ToolError("proposal text exceeds the local edit size limit")
-    reason = proposal.get("reason", "")
-    if not isinstance(reason, str) or len(reason) > 500:
-        raise ToolError("optional reason must be a short string")
-    proposal["reason"] = reason
-    return proposal
+        raise ModelResponseError("proposal JSON must be an object")
+    if set(proposal) != {"edits"} or not isinstance(proposal["edits"], list):
+        raise ModelResponseError("proposal JSON must contain only an edits array")
+    edits = proposal["edits"]
+    if len(edits) > min(max_files, MAX_SUGGESTION_FILES):
+        raise ModelResponseError("suggestion exceeds the allowed file count")
+    normalized = []
+    seen_paths = set()
+    for edit in edits:
+        required = {"path", "old_text", "new_text"}
+        allowed = required | {"reason"}
+        if not isinstance(edit, dict) or not required.issubset(edit) or not set(edit).issubset(allowed):
+            raise ModelResponseError("each edit must contain path, old_text, new_text, and optional reason")
+        if any(not isinstance(edit.get(key), str) for key in required):
+            raise ModelResponseError("edit path and replacement text fields must be strings")
+        if not edit["old_text"]:
+            raise ModelResponseError("old_text must not be empty")
+        if len(edit["old_text"]) > MAX_REPLACEMENT_CHARS or len(edit["new_text"]) > MAX_REPLACEMENT_CHARS:
+            raise ModelResponseError("proposal text exceeds the local edit size limit")
+        reason = edit.get("reason", "")
+        if not isinstance(reason, str) or len(reason) > 500:
+            raise ModelResponseError("optional reason must be a short string")
+        path_key = edit["path"].replace("\\", "/")
+        if path_key in seen_paths:
+            raise ModelResponseError("duplicate edit targets are not allowed")
+        seen_paths.add(path_key)
+        normalized.append({"path": edit["path"], "old_text": edit["old_text"],
+                           "new_text": edit["new_text"], "reason": reason})
+    if not normalized:
+        return None
+    return {"edits": normalized}
 
 
 def _occurrence_count(text, needle):
@@ -82,23 +101,44 @@ def _unified_diff_with_eof_markers(original, modified, rel_path):
     return "".join(output)
 
 
-def build_local_diff(root, proposal):
-    """Apply an exact-once replacement in memory and produce a deterministic diff."""
-    path, original = safe_existing_text_file(root, proposal["path"])
-    old_text = proposal["old_text"]
-    count = _occurrence_count(original, old_text)
-    if count == 0:
-        raise ToolError("old_text was not found exactly in the target file")
-    if count != 1:
-        raise ToolError("old_text must occur exactly once in the target file")
-    modified = original.replace(old_text, proposal["new_text"], 1)
-    if modified == original:
-        raise ToolError("proposal does not change the target file")
-    rel = str(path.relative_to(root))
-    body = _unified_diff_with_eof_markers(original, modified, rel)
-    if not body:
-        raise ToolError("proposal did not produce a text diff")
-    return "diff --git a/{0} b/{0}\n".format(rel) + body
+def build_local_diff(root, proposal, *, allowed_paths=None, forbidden_paths=(), max_files=MAX_SUGGESTION_FILES):
+    """Validate edits in memory, then produce one deterministic combined patch."""
+    edits = proposal.get("edits") if isinstance(proposal, dict) and "edits" in proposal else [proposal]
+    if not isinstance(edits, list) or not 1 <= len(edits) <= min(max_files, MAX_SUGGESTION_FILES):
+        raise ToolError("suggestion rejected: invalid or excessive edit count")
+    prepared = []
+    seen = set()
+    for edit in edits:
+        if not isinstance(edit, dict):
+            raise ToolError("suggestion rejected: each edit must be an object")
+        raw_path = edit.get("path")
+        enforce_path_policy(raw_path, allowed_paths=allowed_paths, forbidden_paths=forbidden_paths)
+        path, original = safe_existing_text_file(root, raw_path)
+        canonical = path.resolve()
+        if canonical in seen:
+            raise ToolError("duplicate edit targets are not allowed")
+        seen.add(canonical)
+        old_text = edit.get("old_text")
+        new_text = edit.get("new_text")
+        if not isinstance(old_text, str) or not isinstance(new_text, str) or not old_text:
+            raise ToolError("proposal path and replacement text fields must be valid strings")
+        count = _occurrence_count(original, old_text)
+        if count == 0:
+            raise ToolError("old_text was not found exactly in the target file")
+        if count != 1:
+            raise ToolError("old_text must occur exactly once in the target file")
+        modified = original.replace(old_text, new_text, 1)
+        if modified == original:
+            raise ToolError("proposal does not change the target file")
+        prepared.append((str(path.relative_to(root)), original, modified))
+
+    patches = []
+    for rel, original, modified in sorted(prepared):
+        body = _unified_diff_with_eof_markers(original, modified, rel)
+        if not body:
+            raise ToolError("proposal did not produce a text diff")
+        patches.append("diff --git a/{0} b/{0}\n".format(rel) + body)
+    return "".join(patches)
 
 
 class ModelModes:
@@ -161,18 +201,21 @@ class ModelModes:
     def suggest_fix(self, question):
         context, files_read, tool_calls = self._context(question)
         response = self._ask([
-            {"role": "system", "content": "Propose one smallest localized text replacement. Return ONLY valid JSON with exactly these required string fields: path (relative path to one existing repository file), old_text (exact text that occurs once), new_text (replacement text), and optional reason (short explanation). Do not return a unified diff, Markdown fence, or text outside the JSON. Do not propose file creation, deletion, rename, or mode changes. If you cannot propose an exact replacement, return the JSON value null."},
+            {"role": "system", "content": f"Propose the smallest localized text edits. Return ONLY valid JSON shaped as {{\"edits\":[{{\"path\":relative path,\"old_text\":exact unique existing text,\"new_text\":replacement text,\"reason\":optional short explanation}}]}}. Use at most {self.assistant.policy.max_files_per_suggestion} distinct existing files. Do not return a unified diff, Markdown fence, or text outside JSON. Do not propose creation, deletion, rename, or mode changes. Return {{\"edits\":[]}} if no exact safe edit can be proposed."},
             {"role": "user", "content": f"SUGGEST FIX (proposal only):\n{question}\n\nREPOSITORY CONTEXT:\n{context}"},
         ], 1200)
-        structured = parse_edit_proposal(response["text"])
+        structured = parse_edit_proposal(response["text"], max_files=self.assistant.policy.max_files_per_suggestion)
         if structured is None:
             return {"proposal": None, "reason": "model declined to propose an exact edit", "files_read": files_read,
                     "tool_calls": tool_calls, "usage": self.last_metadata}
-        patch = build_local_diff(self.assistant.root, structured)
+        patch = build_local_diff(self.assistant.root, structured,
+                                 allowed_paths=self.assistant.policy.allowed_paths,
+                                 forbidden_paths=self.assistant.policy.forbidden_paths,
+                                 max_files=self.assistant.policy.max_files_per_suggestion)
         proposal = self.assistant.suggest_fix(patch)
         return {"proposal": proposal, "files_read": files_read,
                 "tool_calls": tool_calls, "usage": self.last_metadata,
-                "reason": structured["reason"]}
+                "reason": "; ".join(e["reason"] for e in structured["edits"] if e["reason"])}
 
     def apply(self, *_args, **_kwargs):
         raise ToolError("model-connected modes cannot apply patches; use the separate explicit approval flow")

@@ -9,12 +9,67 @@ import sys
 MAX_OUTPUT = 64 * 1024
 MAX_PATCH = 32 * 1024
 TIMEOUT = 20
+MAX_SUGGESTION_FILES = 3
 TOOLS = {"read_file", "search_text", "list_files", "git_status", "git_diff",
          "run_tests", "run_python_compile", "apply_patch"}
 
 
 class ToolError(ValueError):
     pass
+
+
+def normalize_test_argv(command):
+    """Allow only Python unittest discovery; never accept a shell command."""
+    if command is None:
+        command = [sys.executable, "-m", "unittest", "discover", "-s", ".", "-v"]
+    if (not isinstance(command, (list, tuple)) or not 4 <= len(command) <= 16
+            or any(not isinstance(part, str) or not part or len(part) > 256 or "\x00" in part
+                   for part in command)):
+        raise ToolError("test_command must be a bounded argv array")
+    if command[0] not in {"python", "python3", sys.executable}:
+        raise ToolError("test_command must use Python unittest discovery")
+    if list(command[1:4]) != ["-m", "unittest", "discover"]:
+        raise ToolError("test_command must run python -m unittest discover")
+    args = list(command[4:])
+    index = 0
+    seen = set()
+    while index < len(args):
+        option = args[index]
+        if option in {"-v", "-q"}:
+            if option in seen or ("-v" in seen or "-q" in seen):
+                raise ToolError("test_command has conflicting verbosity options")
+            seen.add(option)
+            index += 1
+        elif option == "-s":
+            if option in seen or index + 1 >= len(args) or args[index + 1] != ".":
+                raise ToolError("test_command discovery start must remain the repository root")
+            seen.add(option)
+            index += 2
+        elif option == "-p":
+            if (option in seen or index + 1 >= len(args)
+                    or not re.fullmatch(r"[A-Za-z0-9_.*-]{1,128}", args[index + 1])):
+                raise ToolError("test_command pattern must be a simple filename pattern")
+            seen.add(option)
+            index += 2
+        else:
+            raise ToolError("test_command contains an unsupported unittest option")
+    return [sys.executable, "-m", "unittest", "discover"] + args
+
+
+def _matches_path_rule(path, rule):
+    if rule.endswith("/"):
+        return path.startswith(rule)
+    return path == rule
+
+
+def enforce_path_policy(path, *, allowed_paths=None, forbidden_paths=()):
+    """Apply additive user path rules; built-in path checks run separately."""
+    if not isinstance(path, str) or not path:
+        raise ToolError("target path must be a non-empty relative path")
+    if allowed_paths is not None and not any(_matches_path_rule(path, rule) for rule in allowed_paths):
+        raise ToolError("target path is outside configured allowed_paths")
+    if any(_matches_path_rule(path, rule) for rule in forbidden_paths):
+        raise ToolError("target path is blocked by configured forbidden_paths")
 
 
 def repo_root(value):
@@ -59,7 +114,8 @@ def _run(argv, root, *, input_text=None):
     return {"returncode": p.returncode, "output": out, "truncated": len(p.stdout)+len(p.stderr)>MAX_OUTPUT}
 
 
-_SENSITIVE_NAMES = {".env", ".env.local", ".netrc", "credentials", "id_rsa", "id_ed25519"}
+_SENSITIVE_NAMES = {".env", ".netrc", "credentials", "id_rsa", "id_ed25519"}
+_SENSITIVE_DIRECTORIES = {"secrets", ".ssh", ".aws"}
 _SENSITIVE_SUFFIXES = {".pem", ".p12", ".key"}
 
 
@@ -74,7 +130,9 @@ def safe_existing_text_file(root, value):
         raise ToolError("target must be a relative path inside the repository")
     if any(part == ".git" for part in rel.parts):
         raise ToolError("patch target is a forbidden sensitive path")
-    if rel.name.lower() in _SENSITIVE_NAMES or rel.suffix.lower() in _SENSITIVE_SUFFIXES:
+    if (any(part.lower() in _SENSITIVE_NAMES | _SENSITIVE_DIRECTORIES
+            or part.lower().startswith(".env.")
+            or Path(part).suffix.lower() in _SENSITIVE_SUFFIXES for part in rel.parts)):
         raise ToolError("patch target is a forbidden sensitive path")
 
     candidate = Path(root)
@@ -105,7 +163,7 @@ def safe_existing_text_file(root, value):
     return resolved, content
 
 
-def validate_patch(root, patch, *, allowed_prefixes=("",)):
+def validate_patch(root, patch, *, allowed_paths=None, forbidden_paths=()):
     """Validate a text-only existing-file unified diff without applying it."""
     if not isinstance(patch, str) or len(patch.encode()) > MAX_PATCH:
         raise ToolError("patch missing or exceeds 32 KiB")
@@ -120,20 +178,26 @@ def validate_patch(root, patch, *, allowed_prefixes=("",)):
             if name == "/dev/null":
                 raise ToolError("file creation/deletion is not allowed")
             if name.startswith(("a/", "b/")): name=name[2:]
-            if allowed_prefixes != ("",) and not any(name.startswith(prefix) for prefix in allowed_prefixes):
-                raise ToolError("patch target is outside the approved edit scope")
+            enforce_path_policy(name, allowed_paths=allowed_paths, forbidden_paths=forbidden_paths)
             p, _ = safe_existing_text_file(root, name)
             paths.append(p)
     if not paths or len(paths)%2:
         raise ToolError("patch must contain existing-file unified diff headers")
+    targets=[]
+    for old_path,new_path in zip(paths[0::2],paths[1::2]):
+        if old_path != new_path:
+            raise ToolError("patch must not rename files")
+        if old_path in targets:
+            raise ToolError("patch contains duplicate edit targets")
+        targets.append(old_path)
     return tuple(paths)
 
 
 _check_patch_paths = validate_patch
 
-def check_patch(root, patch, *, allowed_prefixes=("",)):
+def check_patch(root, patch, *, allowed_paths=None, forbidden_paths=()):
     """Validate policy and ensure Git can apply the diff without changing files."""
-    paths=validate_patch(root,patch,allowed_prefixes=allowed_prefixes)
+    paths=validate_patch(root,patch,allowed_paths=allowed_paths,forbidden_paths=forbidden_paths)
     checked=_run(["/usr/bin/git","apply","--check","--whitespace=error","-"],root,input_text=patch)
     if checked["returncode"]:
         raise ToolError("patch check failed: "+checked["output"][:2000])
@@ -163,10 +227,12 @@ def dispatch(root, request):
         return _run(["/usr/bin/grep","-RIn","--exclude-dir=.git","--",query,str(target)],root)
     if name == "git_status": return _run(["/usr/bin/git","status","--short","--branch"],root)
     if name == "git_diff": return _run(["/usr/bin/git","diff","--no-ext-diff","--"],root)
-    if name == "run_tests": return _run([sys.executable,"-m","unittest","discover","-s",".","-v"],root)
+    if name == "run_tests": return _run(normalize_test_argv(args.get("command")),root)
     if name == "run_python_compile": return _run([sys.executable,"-m","compileall","-q","."],root)
     patch=args.get("patch")
-    _check_patch_paths(root,patch)
+    allowed_paths=args.get("allowed_paths")
+    forbidden_paths=args.get("forbidden_paths",())
+    _check_patch_paths(root,patch,allowed_paths=allowed_paths,forbidden_paths=forbidden_paths)
     checked=_run(["/usr/bin/git","apply","--check","--whitespace=error","-"],root,input_text=patch)
     if checked["returncode"]: raise ToolError("patch check failed: "+checked["output"][:2000])
     result=_run(["/usr/bin/git","apply","--whitespace=error","-"],root,input_text=patch)

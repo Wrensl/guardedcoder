@@ -1,0 +1,6 @@
+{
+  "allowed_paths": ["src/", "tests/"],
+  "forbidden_paths": [".env", "secrets/"],
+  "test_command": ["python3", "-m", "unittest", "discover", "-s", ".", "-v"],
+  "max_files_per_suggestion": 2
+}
