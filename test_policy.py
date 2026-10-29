@@ -24,6 +24,7 @@ class PolicyTests(unittest.TestCase):
         (self.root / "tests").mkdir()
         (self.root / "src" / "mod.py").write_text("VALUE = 1\n")
         (self.root / "src" / "blocked.py").write_text("VALUE = 8\n")
+        (self.root / "tests" / "__init__.py").write_text("")
         (self.root / "tests" / "test_mod.py").write_text("import unittest\nclass T(unittest.TestCase):\n def test_ok(self): self.assertTrue(True)\n")
         subprocess.run(["/usr/bin/git", "add", "src", "tests"], cwd=self.root, check=True)
         subprocess.run(["/usr/bin/git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
