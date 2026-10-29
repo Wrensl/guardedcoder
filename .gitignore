@@ -1,0 +1,35 @@
+# Python bytecode and test/tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local environments
+.venv/
+venv/
+env/
+ENV/
+
+# Secrets and local configuration
+.env
+.env.*
+*.pem
+*.key
+*.p12
+
+# macOS and editor artifacts
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Temporary backups, logs, and local output
+*.bak
+*.backup
+*.before-*
+*.log
+*.out

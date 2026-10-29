@@ -1,0 +1,119 @@
+# GuardedCoder
+
+Human-approved AI coding assistant that analyzes repositories, proposes validated code changes, and applies them only after explicit approval.
+
+GuardedCoder is intentionally **non-autonomous**. The model cannot run shell commands, write files, or apply a patch.
+
+## What it is
+
+AI thinks and proposes. Local deterministic code validates. A human decides whether anything gets applied.
+
+GuardedCoder provides a middle ground between read-only AI assistants and highly autonomous coding agents with broad shell and write access. It gathers a small amount of relevant repository context, asks a hosted OpenAI-compatible model for an answer or structured text replacement, and keeps all file-changing actions behind a separate approval step.
+
+## Core workflow
+
+```text
+QUESTION → SUGGEST → local validation → approval token → explicit APPLY → tests → diff
+```
+
+- **QUESTION** sends bounded, relevant repository context for an explanation. It does not write.
+- **SUGGEST** asks for a JSON replacement proposal: an existing file path, exact old text, exact new text, and optional reason. Local code checks that the old text occurs exactly once and creates the unified diff. It does not write.
+- **APPLY** requires the proposal's approval token and a separate explicit `APPLY` confirmation. Local code applies the validated diff, runs the repository's tests, and shows the resulting diff.
+
+QUESTION and SUGGEST send the prompt and bounded selected source snippets to the configured model provider. Use them only with code you are allowed to share with that provider.
+
+## Safety model
+
+- There is no arbitrary model-controlled shell and no model-driven tool loop.
+- QUESTION and SUGGEST do not write repository files.
+- SUGGEST accepts structured text replacements, not model-generated diffs.
+- Local code generates the diff and checks it with `git apply --check`.
+- Paths are restricted to the selected repository; symlink targets and sensitive paths are rejected.
+- Binary files are rejected. The current edit flow does not create, delete, rename, or change modes on files.
+- Applying requires a single-use approval token plus the user's explicit confirmation.
+- Tests run after APPLY. A test failure does not automatically revert the approved edit; review the diff and restore files if needed.
+
+These controls reduce risk; GuardedCoder is **not a formal security sandbox**. It runs as the current user, and tests execute code from the selected repository. Start with a disposable or non-critical Git repository.
+
+## Requirements
+
+- Python 3.9 or later
+- Git
+- An OpenAI-compatible chat-completions API endpoint and API key for QUESTION/SUGGEST
+- No third-party Python packages are required
+
+## Installation
+
+```sh
+git clone https://github.com/OWNER/guardedcoder.git
+cd guardedcoder
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+The implementation uses Python's standard library. The local test suite makes no provider/API requests.
+
+## Configuration
+
+Set the API key in the environment; never commit it or put it in a project file.
+
+Provide `LEVEL2_API_KEY` through your shell's secure environment or secret manager before starting GuardedCoder. Do not put its value in this repository, a prompt, or shell history.
+
+Supported environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LEVEL2_API_KEY` | — | API credential; sent only to the configured provider |
+| `LEVEL2_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible API base URL; remote endpoints must use HTTPS |
+| `LEVEL2_MODEL` | `gpt-6-luna` | Provider model name |
+| `LEVEL2_TIMEOUT` | `45` | Request timeout in seconds (1–180) |
+| `LEVEL2_API_KEY_ENV` | `LEVEL2_API_KEY` | Name of the environment variable containing the API key |
+| `LEVEL2_INPUT_USD_PER_MILLION` | Model default when using default OpenAI GPT-6 Luna; otherwise unset | Optional input-token price for estimates |
+| `LEVEL2_OUTPUT_USD_PER_MILLION` | Model default when using default OpenAI GPT-6 Luna; otherwise unset | Optional output-token price for estimates |
+
+Both pricing variables must be set together. Estimates use provider-reported token usage and are not billing guarantees.
+
+## Usage
+
+Start the interactive CLI:
+
+```sh
+python3 assistant_cli.py
+```
+
+Enter the path to a Git working tree, such as `/path/to/repository`, then choose a mode:
+
+1. **question** — ask a question about the repository. The assistant searches and reads bounded context, then returns an explanation.
+2. **suggest** — describe a small fix. Review the validated diff and its approval token. No file is changed.
+3. **apply** — enter that token, then type `APPLY` at the confirmation prompt. The patch is applied, tests run, and the diff is shown.
+4. **quit** — exit.
+
+Example: for a clamp function whose upper-bound test fails, ask QUESTION why it fails. Then request SUGGEST FIX for the smallest correction. Inspect the proposed diff. Only choose APPLY if you approve that exact proposal.
+
+Approval tokens are held in memory for the current CLI session and are single-use. They do not replace reviewing the diff before approval.
+
+## Development and tests
+
+Run the full local test suite:
+
+```sh
+python3 -m unittest discover -s . -v
+```
+
+Tests use temporary Git repositories and mocked provider responses. They do not require an API key or make network requests.
+
+## Limitations
+
+- Context collection is intentionally bounded and may omit relevant code in larger repositories.
+- A SUGGEST proposal is limited to one exact text replacement in one existing UTF-8 text file; the old text must occur exactly once.
+- Changes that Git cannot validate, including some newline-format edge cases, are rejected.
+- Tests are run using the repository's unittest discovery command; projects with different test setups may need adaptation.
+- APPLY does not automatically roll back when tests fail.
+
+## Security
+
+Do not expose API keys, credentials, private keys, or secrets in prompts or repository context. Use a disposable or non-critical repository first, review every proposed diff, and understand that project tests execute locally with your user permissions.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
