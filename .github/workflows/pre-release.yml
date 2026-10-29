@@ -77,7 +77,7 @@ jobs:
           --volume "$GITHUB_WORKSPACE:/src:ro"
           --workdir /src
           semgrep/semgrep:1.182.0
-          scan --config .semgrep.yml --error --metrics=off .
+          semgrep scan --config .semgrep.yml --error --metrics=off .
 
   smoke:
     name: CLI and policy smoke checks
