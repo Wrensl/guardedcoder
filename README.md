@@ -108,6 +108,15 @@ python3 -m unittest discover -s . -v
 
 Tests use temporary Git repositories and mocked provider responses. They do not require an API key or make network requests.
 
+The pre-release CI gate also runs a Python version matrix, compile and whitespace checks, a redacted Gitleaks scan of repository contents and history, local Semgrep security rules, and CLI/policy smoke checks. To run the scanners locally, install the corresponding tools and run:
+
+```sh
+gitleaks git . --redact=100 --no-banner
+semgrep scan --config .semgrep.yml --error --metrics=off .
+```
+
+The local Semgrep command uses the checked-in rules and does not require cloud login. Gitleaks needs a full Git checkout to scan the complete history. See [RELEASING.md](RELEASING.md) for the release checklist. A release should be created only from a commit with a green **Pre-release safety gate** run.
+
 ## Limitations
 
 - Context collection is intentionally bounded and may omit relevant code in larger repositories.

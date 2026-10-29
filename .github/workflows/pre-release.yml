@@ -1,0 +1,94 @@
+name: Pre-release safety gate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    name: unittest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run unit tests
+        run: python -m unittest discover -s . -v
+
+  quality:
+    name: Compile and whitespace checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Compile Python files
+        run: python -m compileall -q .
+      - name: Check changed lines for whitespace errors
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git diff --check "$PR_BASE_SHA...$CURRENT_SHA"
+          elif [ "$EVENT_NAME" = "push" ] && [ "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            git diff --check "$PUSH_BEFORE_SHA...$CURRENT_SHA"
+          else
+            git diff --check "$CURRENT_SHA^" "$CURRENT_SHA"
+          fi
+
+  gitleaks:
+    name: Gitleaks history scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan repository and Git history
+        run: >-
+          docker run --rm --network none
+          --volume "$GITHUB_WORKSPACE:/repo:ro"
+          --workdir /repo
+          ghcr.io/gitleaks/gitleaks:v8.30.1
+          git . --redact=100 --no-banner
+
+  semgrep:
+    name: Semgrep Python checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run local Semgrep rules
+        run: >-
+          docker run --rm --network none
+          --volume "$GITHUB_WORKSPACE:/src:ro"
+          --workdir /src
+          semgrep/semgrep:1.182.0
+          scan --config .semgrep.yml --error --metrics=off .
+
+  smoke:
+    name: CLI and policy smoke checks
+    runs-on: ubuntu-latest
+    needs: [unittest, quality, gitleaks, semgrep]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check CLI startup and example policy
+        run: |
+          python assistant_cli.py --help >/dev/null
+          python -m json.tool .guardedcoder.example.json >/dev/null

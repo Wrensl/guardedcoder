@@ -1,0 +1,25 @@
+rules:
+  - id: guardedcoder.python.dynamic-code-execution
+    message: Avoid dynamic Python code execution; validate and handle structured data instead.
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+
+  - id: guardedcoder.python.subprocess-shell
+    message: Do not invoke subprocess commands through a shell; use a fixed argv with shell=False.
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+      - pattern: os.system(...)
+      - pattern: os.popen(...)
+
+  - id: guardedcoder.python.unsafe-pickle
+    message: Avoid loading pickle data from untrusted sources because deserialization can execute code.
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
